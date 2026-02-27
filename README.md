@@ -18,7 +18,7 @@ for SQL Server environments including:
 ## Use Case
 
 Helps DBAs maintain encryption compliance by rotating TDE certificates 
-when older than 2 months.
+when older than specific months.
 
 ## Technologies Used
 
