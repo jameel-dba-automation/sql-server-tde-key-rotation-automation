@@ -1,1 +1,257 @@
-Standalone/tde_rotation_standalone.sql
+------------------------------------------------------------
+-- Audit Table Creation in backupDB
+------------------------------------------------------------
+
+--SELECT * FROM Backupdb.dbo.TDECertificateBackupAudit
+
+/*--------------------
+Drop table Backupdb.dbo.TDECertificateBackupAudit
+--------------------*/
+
+
+USE Backupdb;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'TDECertificateBackupAudit')
+BEGIN
+    CREATE TABLE dbo.TDECertificateBackupAudit
+    (
+        AuditID INT IDENTITY(1,1) PRIMARY KEY,
+        ServerName SYSNAME,
+        StepName VARCHAR(50),
+        DatabaseName SYSNAME NULL,
+        CertificateName SYSNAME NULL,
+        CerFilePath NVARCHAR(4000) NULL,
+        PvkFilePath NVARCHAR(4000) NULL,
+        Status VARCHAR(20),
+        ErrorMessage NVARCHAR(4000) NULL,
+        AuditTime DATETIME2(0) DEFAULT SYSDATETIME()
+    );
+END
+GO
+
+------------------------------------------------------------
+-- Begining of the script
+------------------------------------------------------------
+
+USE master;
+SET NOCOUNT ON;
+
+PRINT '===== TDE QUARTERLY ROTATION STARTED =====';
+
+------------------------------------------------------------
+-- VARIABLES
+------------------------------------------------------------
+DECLARE 
+    @BackupPath NVARCHAR(4000) = 'C:\TDE_Rotation\cert_backup\',
+    @Password NVARCHAR(128) = 'MyStrongPassword',
+    @ServerName SYSNAME = REPLACE(@@SERVERNAME,'\','_'),
+    @TimeStamp CHAR(15),
+    @CertName SYSNAME,
+    @NewCertName SYSNAME,
+    @DBName SYSNAME,
+    @IsPrimary INT,
+    @CerFile NVARCHAR(4000),
+    @PvkFile NVARCHAR(4000),
+    @sql NVARCHAR(MAX);
+
+SET @TimeStamp =
+    CONVERT(CHAR(8), GETDATE(), 112) + '_' +
+    REPLACE(CONVERT(CHAR(8), GETDATE(), 108), ':', '');
+
+------------------------------------------------------------
+-- STEP 1: BACKUP EXISTING CERTIFICATES IN USE
+------------------------------------------------------------
+PRINT 'STEP 1: Backing up existing certificates...';
+
+DECLARE cert_cursor CURSOR FAST_FORWARD FOR
+SELECT DISTINCT c.name
+FROM sys.dm_database_encryption_keys dek
+JOIN sys.certificates c
+    ON dek.encryptor_thumbprint = c.thumbprint
+JOIN sys.databases db
+    ON dek.database_id = db.database_id
+WHERE db.is_encrypted = 1;
+
+OPEN cert_cursor;
+FETCH NEXT FROM cert_cursor INTO @CertName;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    BEGIN TRY
+
+        SET @CerFile = @BackupPath + @ServerName + '_OLD_' + @CertName + '_' + @TimeStamp + '.cer';
+        SET @PvkFile = @BackupPath + @ServerName + '_OLD_' + @CertName + '_' + @TimeStamp + '.pvk';
+
+        SET @sql = '
+        BACKUP CERTIFICATE [' + @CertName + ']
+        TO FILE = ''' + @CerFile + '''
+        WITH PRIVATE KEY
+        (
+            FILE = ''' + @PvkFile + ''',
+            ENCRYPTION BY PASSWORD = ''' + @Password + '''
+        );';
+
+        EXEC sp_executesql @sql;
+
+        INSERT INTO Backupdb.dbo.TDECertificateBackupAudit
+        (ServerName, StepName, CertificateName, CerFilePath, PvkFilePath, Status)
+        VALUES
+        (@ServerName, 'ExistingCertBackup', @CertName, @CerFile, @PvkFile, 'SUCCESS');
+
+    END TRY
+    BEGIN CATCH
+
+        INSERT INTO Backupdb.dbo.TDECertificateBackupAudit
+        (ServerName, StepName, CertificateName, Status, ErrorMessage)
+        VALUES
+        (@ServerName, 'ExistingCertBackup', @CertName, 'FAILED', ERROR_MESSAGE());
+
+        THROW;
+    END CATCH;
+
+    FETCH NEXT FROM cert_cursor INTO @CertName;
+END
+
+CLOSE cert_cursor;
+DEALLOCATE cert_cursor;
+
+------------------------------------------------------------
+-- STEP 2: GENERATE NEW QUARTERLY CERTIFICATE NAME
+------------------------------------------------------------
+DECLARE 
+    @Year CHAR(4) = CAST(YEAR(GETDATE()) AS CHAR(4)),
+    @Quarter CHAR(2) = 'Q' + CAST(DATEPART(QUARTER, GETDATE()) AS CHAR(1));
+
+SET @NewCertName = 'TDECert_' + @Year + '_' + @Quarter;
+
+------------------------------------------------------------
+-- STEP 3: CREATE NEW CERTIFICATE IF NOT EXISTS
+------------------------------------------------------------
+BEGIN TRY
+
+    IF NOT EXISTS (SELECT 1 FROM sys.certificates WHERE name = @NewCertName)
+    BEGIN
+        EXEC('CREATE CERTIFICATE [' + @NewCertName + ']
+              WITH SUBJECT = ''Quarterly TDE Rotation'',
+              EXPIRY_DATE = ''2035-12-31'';');
+
+        INSERT INTO Backupdb.dbo.TDECertificateBackupAudit
+        (ServerName, StepName, CertificateName, Status)
+        VALUES
+        (@ServerName, 'CreateNewCertificate', @NewCertName, 'CREATED');
+    END
+    ELSE
+    BEGIN
+        INSERT INTO Backupdb.dbo.TDECertificateBackupAudit
+        (ServerName, StepName, CertificateName, Status)
+        VALUES
+        (@ServerName, 'CreateNewCertificate', @NewCertName, 'ALREADY_EXISTS');
+    END
+
+END TRY
+BEGIN CATCH
+
+    INSERT INTO Backupdb.dbo.TDECertificateBackupAudit
+    (ServerName, StepName, CertificateName, Status, ErrorMessage)
+    VALUES
+    (@ServerName, 'CreateNewCertificate', @NewCertName, 'FAILED', ERROR_MESSAGE());
+
+    THROW;
+END CATCH;
+
+------------------------------------------------------------
+-- STEP 4: ROTATE DEK (PRIMARY ONLY / STANDALONE SAFE)
+------------------------------------------------------------
+PRINT 'STEP 4: Rotating DEKs...';
+
+DECLARE db_cursor CURSOR FAST_FORWARD FOR
+SELECT name
+FROM sys.databases
+WHERE is_encrypted = 1
+  AND name <> 'tempdb';
+
+OPEN db_cursor;
+FETCH NEXT FROM db_cursor INTO @DBName;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    BEGIN TRY
+
+        SELECT @IsPrimary = sys.fn_hadr_is_primary_replica(@DBName);
+
+        IF @IsPrimary = 1 OR @IsPrimary IS NULL
+        BEGIN
+            SET @sql = '
+            USE [' + @DBName + '];
+            ALTER DATABASE ENCRYPTION KEY
+            ENCRYPTION BY SERVER CERTIFICATE [' + @NewCertName + '];';
+
+            EXEC sp_executesql @sql;
+
+            INSERT INTO Backupdb.dbo.TDECertificateBackupAudit
+            (ServerName, StepName, DatabaseName, CertificateName, Status)
+            VALUES
+            (@ServerName, 'DEKRotation', @DBName, @NewCertName, 'SUCCESS');
+        END
+        ELSE
+        BEGIN
+            INSERT INTO Backupdb.dbo.TDECertificateBackupAudit
+            (ServerName, StepName, DatabaseName, CertificateName, Status)
+            VALUES
+            (@ServerName, 'DEKRotation', @DBName, @NewCertName, 'SKIPPED_NOT_PRIMARY');
+        END
+
+    END TRY
+    BEGIN CATCH
+
+        INSERT INTO Backupdb.dbo.TDECertificateBackupAudit
+        (ServerName, StepName, DatabaseName, CertificateName, Status, ErrorMessage)
+        VALUES
+        (@ServerName, 'DEKRotation', @DBName, @NewCertName, 'FAILED', ERROR_MESSAGE());
+
+        THROW;
+    END CATCH;
+
+    FETCH NEXT FROM db_cursor INTO @DBName;
+END
+
+CLOSE db_cursor;
+DEALLOCATE db_cursor;
+
+------------------------------------------------------------
+-- STEP 5: BACKUP NEW CERTIFICATE
+------------------------------------------------------------
+BEGIN TRY
+
+    SET @CerFile = @BackupPath + @ServerName + '_' + @NewCertName + '_' + @TimeStamp + '.cer';
+    SET @PvkFile = @BackupPath + @ServerName + '_' + @NewCertName + '_' + @TimeStamp + '.pvk';
+
+    SET @sql = '
+    BACKUP CERTIFICATE [' + @NewCertName + ']
+    TO FILE = ''' + @CerFile + '''
+    WITH PRIVATE KEY
+    (
+        FILE = ''' + @PvkFile + ''',
+        ENCRYPTION BY PASSWORD = ''' + @Password + '''
+    );';
+
+    EXEC sp_executesql @sql;
+
+    INSERT INTO Backupdb.dbo.TDECertificateBackupAudit
+    (ServerName, StepName, CertificateName, CerFilePath, PvkFilePath, Status)
+    VALUES
+    (@ServerName, 'NewCertBackup', @NewCertName, @CerFile, @PvkFile, 'SUCCESS');
+
+END TRY
+BEGIN CATCH
+
+    INSERT INTO Backupdb.dbo.TDECertificateBackupAudit
+    (ServerName, StepName, CertificateName, Status, ErrorMessage)
+    VALUES
+    (@ServerName, 'NewCertBackup', @NewCertName, 'FAILED', ERROR_MESSAGE());
+
+    THROW;
+END CATCH;
+
+PRINT '===== TDE ROTATION COMPLETED SUCCESSFULLY =====';
